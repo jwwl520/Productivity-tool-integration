@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import eel
@@ -19,6 +19,47 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime
+import logging
+
+# 配置日志系统（打包后不显示命令行窗口）
+if getattr(sys, 'frozen', False):
+    # 打包后：将日志输出到文件
+    log_dir = os.path.join(os.getenv('LOCALAPPDATA', os.path.expanduser('~')), 'Temp', 'ProductivityTools')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'app.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+        ]
+    )
+    
+    # 禁用 print 输出（避免弹出命令行窗口）
+    sys.stdout = open(os.devnull, 'w')
+    sys.stderr = open(os.devnull, 'w')
+else:
+    # 开发模式：输出到控制台
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    
+    # 设置控制台输出编码为UTF-8
+    if sys.stdout is not None and hasattr(sys.stdout, 'encoding') and sys.stdout.encoding != 'utf-8':
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    if sys.stderr is not None and hasattr(sys.stderr, 'encoding') and sys.stderr.encoding != 'utf-8':
+        import io
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# 定义 print 函数的替代品
+def log_print(*args, **kwargs):
+    """替代 print 的日志函数"""
+    message = ' '.join(str(arg) for arg in args)
+    logging.info(message)
 
 class EelToolLauncher:
     def __init__(self):
@@ -49,12 +90,13 @@ class EelToolLauncher:
             },
             # 前端界面仓库配置
             'web_interface': {
-                "owner": "jwwl520",  # 改成你的GitHub用户名
-                "repo": "Tool-Launcher-Web",  # 改成你的前端仓库名
+                "owner": "jwwl520",
+                "repo": "Productivity-tool-integration",
                 "files": [
-                    {"path": "index.html", "local": "index.html"},
-                    {"path": "style.css", "local": "style.css"},
-                    {"path": "script.js", "local": "script.js"}
+                    {"path": "web/index.html", "local": "index.html"},
+                    {"path": "web/style.css", "local": "style.css"},
+                    {"path": "web/script.js", "local": "script.js"},
+                    {"path": "web/config.js", "local": "config.js"}  # 授权配置文件
                 ]
             }
         }
@@ -79,41 +121,130 @@ class EelToolLauncher:
         }
         
         # 缓存配置
-        self.cache_duration = 7 * 24 * 60 * 60  # 7天
-        self.web_cache_duration = 24 * 60 * 60  # 前端文件缓存1天
+        self.cache_duration = 7 * 24 * 60 * 60  # 工具文件：7天
+        self.web_cache_duration = 7 * 24 * 60 * 60  # 前端文件：7天（按周缓存）
         self.machine_id = self.get_machine_id()
+        
         self.cache_dir = self.get_or_create_hidden_cache_dir()
         self.web_cache_dir = os.path.join(self.cache_dir, 'web')
         self.ensure_cache_directory()
         self.cleanup_old_cache_directories()
         
+        # 设备授权验证（在下载前端文件之前先用本地配置验证）
+        if not self.verify_device_authorization():
+            log_print("\n" + "="*60)
+            log_print("🚫 设备未授权")
+            log_print(f"📱 当前设备ID: {self.machine_id}")
+            log_print("📧 请联系管理员获取授权")
+            log_print("="*60 + "\n")
+            sys.exit(1)
+        
         self.tool_processes = {}
         self._python_interpreter = None
 
     def get_machine_id(self):
-        """生成机器唯一标识"""
+        """获取Windows设备ID（系统属性中显示的设备ID）"""
         system = platform.system()
         try:
             if system == "Windows":
-                import subprocess
-                result = subprocess.check_output(['wmic', 'csproduct', 'get', 'UUID'], 
-                                                stderr=subprocess.DEVNULL)
-                uuid_str = result.decode().split('\n')[1].strip()
+                # 方法1：通过注册表获取MachineGuid（最稳定）
+                try:
+                    import winreg
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                                        r'SOFTWARE\Microsoft\Cryptography', 
+                                        0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+                    machine_guid = winreg.QueryValueEx(key, 'MachineGuid')[0]
+                    winreg.CloseKey(key)
+                    uuid_str = machine_guid
+                    # 保存原始GUID供显示用
+                    self._original_guid = uuid_str
+                except:
+                    # 方法2：通过WMIC获取UUID
+                    result = subprocess.check_output(['wmic', 'csproduct', 'get', 'UUID'], 
+                                                    stderr=subprocess.DEVNULL)
+                    uuid_str = result.decode().split('\n')[1].strip()
+                    self._original_guid = uuid_str
             elif system == "Darwin":
                 result = subprocess.check_output(['ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'], 
                                                 stderr=subprocess.DEVNULL)
                 uuid_str = result.decode()
+                self._original_guid = uuid_str
             elif system == "Linux":
                 with open('/etc/machine-id', 'r') as f:
                     uuid_str = f.read().strip()
+                self._original_guid = uuid_str
             else:
                 uuid_str = str(uuid.uuid4())
+                self._original_guid = uuid_str
             
+            # 返回完整的SHA256哈希的前16位
             machine_hash = hashlib.sha256(uuid_str.encode()).hexdigest()
             return machine_hash[:16]
-        except:
-            return hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:16]
+        except Exception as e:
+            log_print(f"警告: 无法获取设备ID: {e}")
+            fallback = str(uuid.uuid4())
+            self._original_guid = fallback
+            return hashlib.sha256(fallback.encode()).hexdigest()[:16]
 
+    def verify_device_authorization(self):
+        """验证设备是否授权（从GitHub下载的config.js读取）"""
+        try:
+            # 从缓存的web目录读取config.js
+            config_path = os.path.join(self.web_cache_dir, 'config.js')
+            
+            # 如果缓存不存在，尝试从本地web目录读取
+            if not os.path.exists(config_path):
+                config_path = os.path.join('web', 'config.js')
+            
+            if not os.path.exists(config_path):
+                log_print("⚠️  警告: 授权配置文件不存在")
+                log_print(f"💡 当前设备ID: {self.machine_id}")
+                log_print("   请创建 web/config.js 并添加授权设备\n")
+                return True  # 开发模式，允许运行
+            
+            # 读取配置文件
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 提取AUTHORIZED_DEVICES数组中的GUID
+            import re
+            pattern_guid = r'"([A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12})"'
+            authorized_guids = re.findall(pattern_guid, content, re.IGNORECASE)
+            
+            # 转换为小写以便比对
+            authorized_guids_lower = [g.lower() for g in authorized_guids]
+            current_guid_lower = getattr(self, '_original_guid', '').lower()
+            
+            log_print(f"📋 从配置读取到 {len(authorized_guids)} 个授权设备")
+            for guid in authorized_guids:
+                log_print(f"   {guid}")
+            
+            log_print(f"\n💻 当前设备GUID: {getattr(self, '_original_guid', '未知')}")
+            
+            if not authorized_guids:
+                log_print("\n⚠️  警告: 未配置授权设备列表")
+                log_print("   请将设备GUID添加到 web/config.js 的 AUTHORIZED_DEVICES 数组中")
+                log_print("   格式: \"3dc6a97e-2166-48b5-ab74-92bbc1674ec5\"")
+                log_print("   然后推送到GitHub，其他用户重启程序即可获得授权\n")
+                return True  # 开发模式，允许运行
+            
+            # 直接比对原始GUID（不区分大小写）
+            if current_guid_lower in authorized_guids_lower:
+                log_print(f"✅ 设备已授权\n")
+                return True
+            else:
+                log_print(f"\n❌ 设备未在授权列表中")
+                log_print(f"💡 请将以下GUID添加到 web/config.js：")
+                log_print(f'   "{getattr(self, "_original_guid", "未知")}"')
+                return False
+                
+        except Exception as e:
+            log_print(f"❌ 授权验证错误: {e}")
+            import traceback
+            traceback.print_exc()
+            log_print(f"💡 当前设备ID: {self.machine_id}\n")
+            return False
+    
     def get_week_identifier(self):
         """获取当前周标识符（格式：YYYY-WW）"""
         now = datetime.now()
@@ -181,43 +312,54 @@ class EelToolLauncher:
         return self._python_interpreter
 
     def download_file_from_github(self, owner, repo, file_path, local_path, progress_callback=None):
-        """从GitHub下载文件（公共仓库无需token）"""
+        """从GitHub下载文件（使用raw.githubusercontent.com，无速率限制）"""
         try:
-            # 使用GitHub API下载文件
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
+            # 确保父目录存在
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            
+            # 使用 raw.githubusercontent.com 直接下载（避免API速率限制）
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{file_path}"
             
             headers = {
-                'Accept': 'application/vnd.github.v3+json',
                 'User-Agent': 'Python-Tool-Launcher'
             }
             
-            response = requests.get(api_url, headers=headers, timeout=30)
+            log_print(f"   → 下载: {file_path}")
+            
+            response = requests.get(raw_url, headers=headers, timeout=30)
             
             if response.status_code == 200:
-                content = response.json()
+                file_content = response.content
                 
-                if 'content' in content:
-                    file_content = base64.b64decode(content['content'])
-                    
-                    with open(local_path, 'wb') as f:
-                        f.write(file_content)
-                    
-                    if progress_callback:
-                        progress_callback(100, f"文件下载完成")
-                    
-                    return True
-                else:
-                    if progress_callback:
-                        progress_callback(0, f"文件内容为空")
-                    return False
-            else:
+                with open(local_path, 'wb') as f:
+                    f.write(file_content)
+                
+                log_print(f"   ✓ 成功: {os.path.basename(local_path)} ({len(file_content)} bytes)")
+                
                 if progress_callback:
-                    progress_callback(0, f"下载失败: HTTP {response.status_code}")
+                    try:
+                        progress_callback(100, f"文件下载完成")
+                    except:
+                        pass  # 忽略回调错误（可能Eel未初始化）
+                
+                return True
+            else:
+                error_msg = f"HTTP {response.status_code}"
+                log_print(f"   ✗ 失败: {error_msg}")
+                if progress_callback:
+                    try:
+                        progress_callback(0, f"下载失败: {error_msg}")
+                    except:
+                        pass
                 return False
                 
         except Exception as e:
+            log_print(f"   ✗ 异常: {str(e)}")
             if progress_callback:
-                progress_callback(0, f"下载异常: {str(e)}")
+                try:
+                    progress_callback(0, f"下载异常: {str(e)}")
+                except:
+                    pass
             return False
 
     def download_web_interface(self):
@@ -227,7 +369,7 @@ class EelToolLauncher:
             if not web_config:
                 return True  # 如果没有配置，使用本地文件
             
-            print("正在检查前端文件更新...")
+            log_print("正在检查前端文件更新...")
             
             for file_info in web_config['files']:
                 local_path = os.path.join(self.web_cache_dir, file_info['local'])
@@ -240,7 +382,7 @@ class EelToolLauncher:
                 
                 # 如果缓存无效，下载新版本
                 if not cache_valid:
-                    print(f"下载: {file_info['path']}")
+                    log_print(f"下载: {file_info['path']}")
                     success = self.download_file_from_github(
                         web_config['owner'],
                         web_config['repo'],
@@ -249,20 +391,20 @@ class EelToolLauncher:
                     )
                     
                     if not success:
-                        print(f"警告: 无法下载 {file_info['path']}, 将使用本地文件")
+                        log_print(f"警告: 无法下载 {file_info['path']}, 将使用本地文件")
                         # 如果下载失败且本地也没有，从web目录复制
                         if not os.path.exists(local_path):
                             local_web_file = os.path.join('web', file_info['local'])
                             if os.path.exists(local_web_file):
                                 shutil.copy2(local_web_file, local_path)
                 else:
-                    print(f"使用缓存: {file_info['path']}")
+                    log_print(f"使用缓存: {file_info['path']}")
             
-            print("前端文件准备完成")
+            log_print("前端文件准备完成")
             return True
             
         except Exception as e:
-            print(f"下载前端文件失败: {str(e)}")
+            log_print(f"下载前端文件失败: {str(e)}")
             # 如果下载失败，尝试从本地web目录复制
             try:
                 for file_info in web_config['files']:
@@ -381,13 +523,36 @@ class EelToolLauncher:
             return {"success": False, "message": f"启动失败: {str(e)}"}
 
     def check_and_update_all(self):
-        """检查并更新所有工具"""
+        """检查并更新所有工具和前端界面"""
         try:
+            # 1. 更新前端文件
+            try:
+                eel.updateProgress(10, "正在更新前端界面...")
+            except:
+                pass  # Eel 未初始化时忽略
+            
+            web_config = self._internal_config.get('web_interface')
+            if web_config:
+                for file_info in web_config['files']:
+                    local_path = os.path.join(self.web_cache_dir, file_info['local'])
+                    success = self.download_file_from_github(
+                        web_config['owner'],
+                        web_config['repo'],
+                        file_info['path'],
+                        local_path
+                    )
+                    if not success:
+                        log_print(f"警告: 更新前端文件 {file_info['path']} 失败")
+            
+            # 2. 更新工具文件
             total_tools = len(self._internal_config['repositories'])
             
             for i, (tool_id, repo_config) in enumerate(self._internal_config['repositories'].items()):
-                percent = (i / total_tools) * 100
-                eel.updateProgress(percent, f"更新 {self.tools[tool_id]['name']}...")
+                percent = 20 + (i / total_tools) * 80  # 20-100%
+                try:
+                    eel.updateProgress(percent, f"更新 {self.tools[tool_id]['name']}...")
+                except:
+                    pass  # Eel 未初始化时忽略
                 
                 local_file = os.path.join(self.cache_dir, repo_config['local_name'])
                 
@@ -395,16 +560,18 @@ class EelToolLauncher:
                     repo_config['owner'],
                     repo_config['repo'],
                     repo_config['file_path'],
-                    local_file,
-                    eel.updateProgress
+                    local_file
                 )
                 
                 if not success:
                     return {"success": False, "message": f"更新 {self.tools[tool_id]['name']} 失败"}
             
-            eel.updateProgress(100, "更新完成")
+            try:
+                eel.updateProgress(100, "更新完成")
+            except:
+                pass  # Eel 未初始化时忽略
             
-            return {"success": True, "message": "所有工具已更新到最新版本"}
+            return {"success": True, "message": "所有工具和界面已更新到最新版本"}
             
         except Exception as e:
             return {"success": False, "message": f"更新失败: {str(e)}"}
@@ -439,21 +606,25 @@ def main():
     # 创建启动器实例
     launcher = EelToolLauncher()
     
-    # 下载最新的前端界面文件
+    # 下载最新的前端界面文件（静默下载，不触发Eel调用）
+    log_print("\n" + "="*60)
     launcher.download_web_interface()
+    log_print("="*60 + "\n")
     
     # 初始化Eel，使用缓存的web目录
     if os.path.exists(launcher.web_cache_dir) and os.listdir(launcher.web_cache_dir):
         eel.init(launcher.web_cache_dir)
-        print(f"使用缓存的前端文件: {launcher.web_cache_dir}")
+        log_print(f"✓ 使用缓存的前端文件: {launcher.web_cache_dir}")
     else:
         # 如果缓存不存在，使用本地web目录
         eel.init('web')
-        print("使用本地前端文件")
+        log_print("✓ 使用本地前端文件")
+    
+    log_print("\n🚀 正在启动应用...\n")
     
     # 启动应用
     try:
-        eel.start('index.html', size=(1000, 700), port=0)
+        eel.start('index.html', size=(1280, 720), port=0)
     except (SystemExit, MemoryError, KeyboardInterrupt):
         pass
 
