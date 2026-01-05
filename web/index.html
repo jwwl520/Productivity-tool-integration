@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>生产力工具整合</title>
+    <link rel="stylesheet" href="style.css">
+    <script type="text/javascript" src="/eel.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部 -->
+        <header class="header">
+            <h1>🚀 生产力工具整合</h1>
+            <p class="subtitle">专业工具集成平台</p>
+        </header>
+
+        <!-- 工具卡片网格 -->
+        <div class="tools-grid" id="toolsGrid">
+            <!-- 工具卡片将通过 JavaScript 动态加载 -->
+        </div>
+
+        <!-- 手动更新区域 -->
+        <div class="update-section">
+            <button class="update-btn" onclick="checkUpdates()">
+                <span class="btn-icon">🔄</span>
+                <span>检查更新</span>
+            </button>
+        </div>
+
+        <!-- 进度模态框 -->
+        <div class="modal" id="progressModal" style="display: none;">
+            <div class="modal-content">
+                <h3 id="progressTitle">正在处理...</h3>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+                <p class="progress-text" id="progressText">0%</p>
+                <p class="progress-status" id="progressStatus">准备中...</p>
+            </div>
+        </div>
+
+        <!-- 提示模态框 -->
+        <div class="modal" id="messageModal" style="display: none;">
+            <div class="modal-content">
+                <h3 id="messageTitle">提示</h3>
+                <p id="messageText"></p>
+                <button class="close-btn" onclick="closeMessageModal()">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
